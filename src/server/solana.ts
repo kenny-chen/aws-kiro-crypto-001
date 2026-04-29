@@ -1,5 +1,11 @@
 import { Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js";
-import { createTransferInstruction, getAssociatedTokenAddress } from "@solana/spl-token";
+import { createTransferCheckedInstruction, getAssociatedTokenAddress, getOrCreateAssociatedTokenAccount } from "@solana/spl-token";
+import BN from "bn.js";
+import bs58 from "bs58";
+
+function toUsdcSmallestUnit(amount: number): number {
+  return new BN(Math.round(amount * 1_000_000)).toNumber();
+}
 import { db } from "@/db/client";
 import { chainTx } from "@/db/schema";
 import { eq } from "drizzle-orm";
@@ -13,10 +19,14 @@ function getConnection(): Connection {
 
 function getPlatformKeypair(): Keypair {
   const key = process.env.PLATFORM_PRIVATE_KEY!;
-  return Keypair.fromSecretKey(Buffer.from(key, "base64"));
+  if (key.trimStart().startsWith("[")) {
+    return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(key)));
+  }
+  return Keypair.fromSecretKey(bs58.decode(key));
 }
 
 const USDC_MINT = () => new PublicKey(process.env.SOLANA_USDC_MINT!);
+const USDC_DECIMALS = 6;
 const MAX_RETRIES = 3;
 const RETRY_BASE_MS = 2000;
 
@@ -38,10 +48,10 @@ export async function sendUsdcTransfer(params: {
   try {
     const fromAta = await getAssociatedTokenAddress(mint, new PublicKey(params.fromAddress));
     const toAta = await getAssociatedTokenAddress(mint, new PublicKey(params.toAddress));
-    const amountLamports = Math.round(params.amount * 1_000_000); // USDC has 6 decimals
+    const amountLamports = toUsdcSmallestUnit(params.amount);
 
     const tx = new Transaction().add(
-      createTransferInstruction(fromAta, toAta, payer.publicKey, amountLamports)
+      createTransferCheckedInstruction(fromAta, mint, toAta, payer.publicKey, amountLamports, USDC_DECIMALS)
     );
 
     const signature = await connection.sendTransaction(tx, [payer]);
@@ -54,6 +64,41 @@ export async function sendUsdcTransfer(params: {
     const error = e instanceof Error ? e.message : "Unknown error";
     await db.update(chainTx).set({ status: "failed", failedAt: new Date(), error }).where(eq(chainTx.id, params.chainTxId));
     logger.error("USDC transfer failed", { chainTxId: params.chainTxId, error });
+    return { error };
+  }
+}
+
+export async function sendBatchUsdcTransfer(params: {
+  transfers: { chainTxId: string; toAddress: string; amount: number }[];
+}): Promise<{ signature: string } | { error: string }> {
+  const connection = getConnection();
+  const payer = getPlatformKeypair();
+  const mint = USDC_MINT();
+
+  try {
+    const fromAta = await getAssociatedTokenAddress(mint, payer.publicKey);
+    const tx = new Transaction();
+    for (const t of params.transfers) {
+      const toAccount = await getOrCreateAssociatedTokenAccount(connection, payer, mint, new PublicKey(t.toAddress));
+      const amountLamports = toUsdcSmallestUnit(t.amount);
+      tx.add(createTransferCheckedInstruction(fromAta, mint, toAccount.address, payer.publicKey, amountLamports, USDC_DECIMALS));
+    }
+
+    const signature = await connection.sendTransaction(tx, [payer]);
+
+    for (const t of params.transfers) {
+      await db.update(chainTx).set({ signature, status: "submitted" }).where(eq(chainTx.id, t.chainTxId));
+    }
+
+    logger.info("Batch USDC transfer submitted", { signature, count: params.transfers.length });
+    return { signature };
+  } catch (e: any) {
+    console.error("Raw batch transfer error:", e);
+    const error = e?.message || e?.logs?.join("\n") || (typeof e === "string" ? e : JSON.stringify(e, Object.getOwnPropertyNames(e))) || "Unknown error";
+    for (const t of params.transfers) {
+      await db.update(chainTx).set({ status: "failed", failedAt: new Date(), error }).where(eq(chainTx.id, t.chainTxId));
+    }
+    logger.error("Batch USDC transfer failed", { error, logs: e?.logs });
     return { error };
   }
 }

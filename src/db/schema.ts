@@ -40,6 +40,7 @@ export const userAccount = pgTable("user_account", {
   id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
   walletAddress: text("wallet_address").notNull(),
   displayName: text("display_name"),
+  avatarUrl: text("avatar_url"),
   status: userStatus("status").notNull().default("active"),
   invitedByUserId: uuid("invited_by_user_id").references((): any => userAccount.id),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -155,7 +156,7 @@ export const chainTx = pgTable("chain_tx", {
   meta: jsonb("meta").notNull().default(sql`'{}'::jsonb`),
 }, (t) => ({
   idemUq: uniqueIndex("uq_chain_tx_idempotency").on(t.idempotencyKey),
-  sigUq: uniqueIndex("uq_chain_tx_signature").on(t.signature),
+  sigIdx: index("idx_chain_tx_signature").on(t.signature),
   statusIdx: index("idx_chain_tx_status").on(t.status),
   entityIdx: index("idx_chain_tx_entity").on(t.relatedEntityType, t.relatedEntityId),
 }));
